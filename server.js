@@ -48,7 +48,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     const payload = {
       model: model || MODEL,
       messages: messages,
-      max_tokens: max_tokens || MAX_TOKENS,
+      max_tokens: (max_tokens && max_tokens > 0) ? max_tokens : MAX_TOKENS,
       temperature: temperature !== undefined ? temperature : TEMPERATURE,
       stream: stream !== undefined ? stream : true,
     };
