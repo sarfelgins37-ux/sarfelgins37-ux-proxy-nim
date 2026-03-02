@@ -13,34 +13,22 @@ app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ limit: "100mb", extended: true }));
 
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
-const NVIDIA_BASE_URL =
-  process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
+const NVIDIA_BASE_URL = process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
 const MODEL = process.env.MODEL || "deepseek-ai/deepseek-r1";
 const SHOW_REASONING = process.env.SHOW_REASONING === "true";
-const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || "4096");
 const TEMPERATURE = parseFloat(process.env.TEMPERATURE || "0.6");
 
-// Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", model: MODEL, show_reasoning: SHOW_REASONING });
 });
 
-// Models list
 app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
-    data: [
-      {
-        id: MODEL,
-        object: "model",
-        created: Date.now(),
-        owned_by: "nvidia-nim-proxy",
-      },
-    ],
+    data: [{ id: MODEL, object: "model", created: Date.now(), owned_by: "nvidia-nim-proxy" }],
   });
 });
 
-// Chat completions
 app.post("/v1/chat/completions", async (req, res) => {
   try {
     const { messages, stream, max_tokens, temperature, model } = req.body;
@@ -48,9 +36,9 @@ app.post("/v1/chat/completions", async (req, res) => {
     const payload = {
       model: model || MODEL,
       messages: messages,
-      max_tokens: (max_tokens && max_tokens > 0) ? max_tokens : MAX_TOKENS,
       temperature: temperature !== undefined ? temperature : TEMPERATURE,
       stream: stream !== undefined ? stream : true,
+      ...(max_tokens && max_tokens > 0 ? { max_tokens } : {}),
     };
 
     const response = await axios.post(
@@ -73,7 +61,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       res.setHeader("Connection", "keep-alive");
 
       let buffer = "";
-      let reasoningBuffer = "";
       let inReasoning = false;
       let reasoningSent = false;
 
@@ -93,96 +80,50 @@ app.post("/v1/chat/completions", async (req, res) => {
           try {
             const parsed = JSON.parse(data);
             const delta = parsed.choices?.[0]?.delta || {};
+            let contentToSend = "";
 
-            // Handle reasoning_content field (DeepSeek style)
-            if (delta.reasoning_content && SHOW_REASONING) {
+            if (delta.reasoning_content) {
               if (!inReasoning) {
                 inReasoning = true;
-                // Send opening think tag
-                const thinkStart = {
-                  ...parsed,
-                  choices: [
-                    {
-                      ...parsed.choices[0],
-                      delta: { content: "<think>\n" },
-                    },
-                  ],
-                };
-                res.write(`data: ${JSON.stringify(thinkStart)}\n\n`);
+                if (SHOW_REASONING) contentToSend += "<think>\n";
               }
-              const reasoningChunk = {
+              if (SHOW_REASONING) contentToSend += delta.reasoning_content;
+            }
+
+            if (delta.content !== undefined && inReasoning && !reasoningSent) {
+              inReasoning = false;
+              reasoningSent = true;
+              if (SHOW_REASONING) contentToSend += "\n</think>\n\n";
+            }
+
+            if (delta.content) contentToSend += delta.content;
+
+            if (contentToSend) {
+              const outChunk = {
                 ...parsed,
-                choices: [
-                  {
-                    ...parsed.choices[0],
-                    delta: { content: delta.reasoning_content },
-                  },
-                ],
+                choices: [{ ...parsed.choices[0], delta: { content: contentToSend } }],
               };
-              res.write(`data: ${JSON.stringify(reasoningChunk)}\n\n`);
-            } else if (delta.reasoning_content && !SHOW_REASONING) {
-              // Skip reasoning silently
-              continue;
-            } else {
-              // Close think tag if we were in reasoning
-              if (inReasoning && !reasoningSent) {
-                inReasoning = false;
-                reasoningSent = true;
-                const thinkEnd = {
-                  ...parsed,
-                  choices: [
-                    {
-                      ...parsed.choices[0],
-                      delta: { content: "\n</think>\n\n" },
-                    },
-                  ],
-                };
-                res.write(`data: ${JSON.stringify(thinkEnd)}\n\n`);
-              }
-              if (delta.content !== undefined) {
-                res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-              }
+              res.write(`data: ${JSON.stringify(outChunk)}\n\n`);
             }
-          } catch (e) {
-            // Skip unparseable lines
-          }
+          } catch (e) {}
         }
       });
 
-      response.data.on("end", () => {
-        res.end();
-      });
+      response.data.on("end", () => res.end());
+      response.data.on("error", (err) => { console.error("Stream error:", err); res.end(); });
 
-      response.data.on("error", (err) => {
-        console.error("Stream error:", err);
-        res.end();
-      });
     } else {
-      // Non-streaming
       const result = response.data;
-      if (!SHOW_REASONING) {
-        // Strip reasoning from non-streaming response
-        if (result.choices) {
-          result.choices = result.choices.map((c) => {
-            if (c.message?.reasoning_content) {
-              delete c.message.reasoning_content;
-            }
-            return c;
-          });
-        }
-      } else {
-        // Wrap reasoning in think tags
-        if (result.choices) {
-          result.choices = result.choices.map((c) => {
-            if (c.message?.reasoning_content) {
-              c.message.content =
-                `<think>\n${c.message.reasoning_content}\n</think>\n\n` +
-                (c.message.content || "");
-              delete c.message.reasoning_content;
-            }
-            return c;
-          });
-        }
+      if (result.choices) {
+        result.choices = result.choices.map((c) => {
+          if (c.message?.reasoning_content) {
+            c.message.content = SHOW_REASONING
+              ? `<think>\n${c.message.reasoning_content}\n</think>\n\n` + (c.message.content || "")
+              : (c.message.content || "");
+            delete c.message.reasoning_content;
+          }
+          return c;
+        });
       }
       res.json(result);
     }
