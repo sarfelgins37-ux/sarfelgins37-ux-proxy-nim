@@ -12,132 +12,69 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ limit: "100mb", extended: true }));
 
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
-const NVIDIA_BASE_URL = process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
-const MODEL = process.env.MODEL || "deepseek-ai/deepseek-r1";
-const SHOW_REASONING = process.env.SHOW_REASONING === "true";
-const TEMPERATURE = parseFloat(process.env.TEMPERATURE || "0.6");
+// CONFIG: Set these in Railway environment variables
+const TARGET_API_KEY = process.env.TARGET_API_KEY || "";  // Your iflow.cn sk-...
+const TARGET_BASE_URL = process.env.TARGET_BASE_URL || "https://apis.iflow.cn/v1";
+const MODEL = process.env.MODEL || "kimi-k2";
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", model: MODEL, show_reasoning: SHOW_REASONING });
+  res.json({ status: "ok", model: MODEL, target: TARGET_BASE_URL });
 });
 
 app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
-    data: [{ id: MODEL, object: "model", created: Date.now(), owned_by: "nvidia-nim-proxy" }],
+    data: [{ id: MODEL, object: "model", created: Date.now(), owned_by: "iflow-proxy" }],
   });
 });
 
 app.post("/v1/chat/completions", async (req, res) => {
+  // LOG EVERYTHING FROM JANITOR.AI
+  console.log("\n========== INCOMING REQUEST FROM JANITOR.AI ==========");
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("=====================================================\n");
+
   try {
     const { messages, stream, max_tokens, temperature, model } = req.body;
 
     const payload = {
       model: model || MODEL,
       messages: messages,
-      temperature: temperature !== undefined ? temperature : TEMPERATURE,
-      stream: stream !== undefined ? stream : true,
+      temperature: temperature !== undefined ? temperature : 0.7,
+      stream: stream !== undefined ? stream : false,
       ...(max_tokens && max_tokens > 0 ? { max_tokens } : {}),
     };
 
+    // FORWARD TO IFLOW.CN
     const response = await axios.post(
-      `${NVIDIA_BASE_URL}/chat/completions`,
+      `${TARGET_BASE_URL}/chat/completions`,
       payload,
       {
         headers: {
-          Authorization: `Bearer ${NVIDIA_API_KEY}`,
+          Authorization: `Bearer ${TARGET_API_KEY}`,
           "Content-Type": "application/json",
-          Accept: payload.stream ? "text/event-stream" : "application/json",
+          Accept: "application/json",  // Force this to avoid 406
         },
-        responseType: payload.stream ? "stream" : "json",
+        responseType: "json",
         timeout: 300000,
       }
     );
 
-    if (payload.stream) {
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
+    console.log("iflow.cn response status:", response.status);
+    res.json(response.data);
 
-      let buffer = "";
-      let inReasoning = false;
-      let reasoningSent = false;
-
-      response.data.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop();
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") {
-            res.write("data: [DONE]\n\n");
-            continue;
-          }
-
-          try {
-            const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta || {};
-            let contentToSend = "";
-
-            if (delta.reasoning_content) {
-              if (!inReasoning) {
-                inReasoning = true;
-                if (SHOW_REASONING) contentToSend += "<think>\n";
-              }
-              if (SHOW_REASONING) contentToSend += delta.reasoning_content;
-            }
-
-            if (delta.content !== undefined && inReasoning && !reasoningSent) {
-              inReasoning = false;
-              reasoningSent = true;
-              if (SHOW_REASONING) contentToSend += "\n</think>\n\n";
-            }
-
-            if (delta.content) contentToSend += delta.content;
-
-            if (contentToSend) {
-              const outChunk = {
-                ...parsed,
-                choices: [{ ...parsed.choices[0], delta: { content: contentToSend } }],
-              };
-              res.write(`data: ${JSON.stringify(outChunk)}\n\n`);
-            }
-          } catch (e) {}
-        }
-      });
-
-      response.data.on("end", () => res.end());
-      response.data.on("error", (err) => { console.error("Stream error:", err); res.end(); });
-
-    } else {
-      const result = response.data;
-      if (result.choices) {
-        result.choices = result.choices.map((c) => {
-          if (c.message?.reasoning_content) {
-            c.message.content = SHOW_REASONING
-              ? `<think>\n${c.message.reasoning_content}\n</think>\n\n` + (c.message.content || "")
-              : (c.message.content || "");
-            delete c.message.reasoning_content;
-          }
-          return c;
-        });
-      }
-      res.json(result);
-    }
   } catch (err) {
+    console.error("Proxy error:", err.response?.status, err.response?.data || err.message);
     const status = err.response?.status || 500;
-    const message = err.response?.data || err.message;
-    console.error("Proxy error:", status, message);
-    res.status(status).json({ error: message });
+    const message = err.response?.data || { error: err.message };
+    res.status(status).json(message);
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy running on port ${PORT}`);
+  console.log(`Target: ${TARGET_BASE_URL}`);
   console.log(`Model: ${MODEL}`);
-  console.log(`Show reasoning: ${SHOW_REASONING}`);
 });
